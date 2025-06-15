@@ -214,10 +214,33 @@ class AdminWindow(QMainWindow):
         self.load_products()
         self.load_categories()
         self.load_last_orders()
+        self.load_orders()  # Загружаем заказы для статистики
 
-        # Заглушки для других данных
-        self.orders_card.findChild(QLabel, "value").setText("N/A")
-        self.revenue_card.findChild(QLabel, "value").setText("N/A")
+    def load_orders(self):
+        """Загружает список всех заказов и обновляет статистику"""
+        try:
+            response = requests.get(
+                f"{self.api_url}/orders/",
+                headers=self.get_auth_headers()
+            )
+
+            if response.status_code == 200:
+                self.all_orders = response.json()
+                self.apply_filters()  # Применяем фильтры после загрузки
+
+                # Рассчитываем статистику
+                total_orders = len(self.all_orders)
+                total_revenue = sum(order.get('total_amount', 0) for order in self.all_orders)
+
+                # Обновляем карточки
+                self.orders_card.findChild(QLabel, "value").setText(str(total_orders))
+                self.revenue_card.findChild(QLabel, "value").setText(f"{total_revenue:,.2f} ₽".replace(",", " "))
+
+            else:
+                QMessageBox.warning(self, "Ошибка",
+                                    f"Не удалось загрузить заказы. Код ошибки: {response.status_code}")
+        except requests.exceptions.RequestException as e:
+            QMessageBox.critical(self, "Ошибка подключения", f"Не удалось подключиться к серверу: {str(e)}")
 
     def create_dashboard_widget(self):
         """Создает виджет главной панели"""
@@ -2457,14 +2480,13 @@ class AdminWindow(QMainWindow):
         dialog.exec_()
 
     def update_order_status(self, order, new_status):
-        """Обновляет статус заказа через PUT запрос"""
+        """Обновляет статус заказа"""
         if QMessageBox.question(self, "Подтверждение",
                                 f"Изменить статус заказа #{order['id']} на '{new_status}'?",
                                 QMessageBox.Yes | QMessageBox.No) == QMessageBox.No:
             return
 
         try:
-            # Подготавливаем данные для обновления
             update_data = {
                 "customer_id": order.get("customer_id", 0),
                 "order_date": order.get("order_date", ""),
@@ -2479,8 +2501,8 @@ class AdminWindow(QMainWindow):
             )
 
             if response.status_code == 200:
+                self.load_orders()  # Перезагружаем данные и статистику
                 QMessageBox.information(self, "Успех", f"Статус заказа изменен на '{new_status}'")
-                self.load_orders()  # Перезагружаем данные
             else:
                 error_msg = f"Не удалось изменить статус. Код ошибки: {response.status_code}"
                 if response.text:

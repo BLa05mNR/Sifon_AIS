@@ -614,15 +614,14 @@ async def get_order_detail(
         db: AsyncSession = Depends(get_db),
         _: TokenData = Depends(require_role("admin"))
 ):
-    # Запрос с join для получения информации о товаре
     result = await db.execute(
         select(
             OrderDetail,
-            Order.order_date,
-            Product.name.label("product_name")
+            Product.name.label("product_name"),
+            Order.order_date
         )
-        .join(Order, OrderDetail.order_id == Order.id)
         .join(Product, OrderDetail.product_id == Product.id)
+        .join(Order, OrderDetail.order_id == Order.id)
         .where(OrderDetail.id == order_detail_id)
     )
 
@@ -630,15 +629,16 @@ async def get_order_detail(
     if not detail:
         raise HTTPException(status_code=404, detail="Деталь заказа не найдена")
 
-    return {
-        "id": detail.OrderDetail.id,
-        "order_id": detail.OrderDetail.order_id,
-        "product_id": detail.OrderDetail.product_id,
-        "product_name": detail.product_name,
-        "quantity": detail.OrderDetail.quantity,
-        "price_per_unit": detail.OrderDetail.price_per_unit,
-        "order_date": detail.order_date
-    }
+    return OrderDetailOut(
+        id=detail.OrderDetail.id,
+        order_id=detail.OrderDetail.order_id,
+        product_id=detail.OrderDetail.product_id,
+        product_name=detail.product_name,
+        quantity=detail.OrderDetail.quantity,
+        price_per_unit=detail.OrderDetail.price_per_unit,
+        order_date=detail.order_date
+    )
+
 
 @order_detail_router.get("/supplier/{supplier_id}", response_model=list[OrderDetailSupplierOut])
 async def get_order_details_by_supplier(
@@ -648,54 +648,48 @@ async def get_order_details_by_supplier(
         db: AsyncSession = Depends(get_db),
         _: TokenData = Depends(require_role("supplier"))
 ):
-    # Получаем все продукты для данного поставщика
-    products_result = await db.execute(select(Product).where(Product.supplier_id == supplier_id))
-    products = products_result.scalars().all()
+    # 1. First verify the supplier exists
+    supplier = await db.get(Supplier, supplier_id)
+    if not supplier:
+        raise HTTPException(status_code=404, detail="Supplier not found")
 
-    if not products:
-        raise HTTPException(status_code=404, detail="Продукты для поставщика не найдены")
-
-    # Получаем все детали заказов для этих продуктов с информацией о заказе и продукте
-    product_ids = [product.id for product in products]
-
-    # Базовый запрос с join
+    # 2. Build the base query
     query = (
         select(
             OrderDetail,
-            Order.order_date,
-            Product.name.label("product_name")
+            Product.name.label("product_name"),
+            Order.order_date
         )
-        .join(Order, OrderDetail.order_id == Order.id)
         .join(Product, OrderDetail.product_id == Product.id)
-        .where(OrderDetail.product_id.in_(product_ids))
+        .join(Order, OrderDetail.order_id == Order.id)
+        .where(Product.supplier_id == supplier_id)
     )
 
-    # Добавляем фильтрацию по дате если указаны параметры
+    # 3. Apply date filters if provided
     if start_date:
         query = query.where(Order.order_date >= start_date)
     if end_date:
-        query = query.where(Order.order_date <= end_date)
+        # Include the entire end date by using <= end_date + 1 day
+        query = query.where(Order.order_date <= end_date + timedelta(days=1))
 
-    # Выполняем запрос
+    # 4. Execute the query
     result = await db.execute(query)
-    order_details = result.all()
+    details = result.all()
 
-    if not order_details:
-        raise HTTPException(status_code=404, detail="Детали заказов для поставщика не найдены")
-
-    # Формируем ответ
+    # 5. Return results or empty list instead of 404 if no results found
     return [
-        {
-            "id": detail.OrderDetail.id,
-            "order_id": detail.OrderDetail.order_id,
-            "product_id": detail.OrderDetail.product_id,
-            "product_name": detail.product_name,
-            "quantity": detail.OrderDetail.quantity,
-            "price_per_unit": detail.OrderDetail.price_per_unit,
-            "order_date": detail.order_date
-        }
-        for detail in order_details
+        OrderDetailSupplierOut(
+            id=detail.OrderDetail.id,
+            order_id=detail.OrderDetail.order_id,
+            product_id=detail.OrderDetail.product_id,
+            product_name=detail.product_name,
+            quantity=detail.OrderDetail.quantity,
+            price_per_unit=detail.OrderDetail.price_per_unit,
+            order_date=detail.order_date
+        )
+        for detail in details
     ]
+
 
 @order_detail_router.post("/", response_model=OrderDetailOut, status_code=201)
 async def create_order_detail(
@@ -708,13 +702,24 @@ async def create_order_detail(
     await db.commit()
     await db.refresh(new_order_detail)
 
-    # Загружаем связанный заказ с датой
-    order = await db.execute(select(Order).where(Order.id == new_order_detail.order_id))
-    order = order.scalar_one()
+    # Get the related product to include product_name
+    product_result = await db.execute(
+        select(Product).where(Product.id == new_order_detail.product_id))
+    product = product_result.scalar_one()
 
-    # Возвращаем с датой заказа
+    # Get the related order to include order_date
+    order_result = await db.execute(
+        select(Order).where(Order.id == new_order_detail.order_id))
+    order = order_result.scalar_one()
+
+    # Return with all required fields
     return OrderDetailOut(
-        **new_order_detail.__dict__,
+        id=new_order_detail.id,
+        order_id=new_order_detail.order_id,
+        product_id=new_order_detail.product_id,
+        product_name=product.name,  # Include product name
+        quantity=new_order_detail.quantity,
+        price_per_unit=new_order_detail.price_per_unit,
         order_date=order.order_date
     )
 
@@ -758,77 +763,66 @@ async def get_order_details_by_customer(
         db: AsyncSession = Depends(get_db),
         _: TokenData = Depends(require_role(["admin", "customer"]))
 ):
-    stmt = (
-        select(OrderDetail, Order.order_date)
+    result = await db.execute(
+        select(
+            OrderDetail,
+            Product.name.label("product_name"),
+            Order.order_date
+        )
         .join(Order, OrderDetail.order_id == Order.id)
+        .join(Product, OrderDetail.product_id == Product.id)
         .where(Order.customer_id == customer_id)
     )
 
-    result = await db.execute(stmt)
-    results = result.all()
+    details = result.all()
 
-    if not results:
-        raise HTTPException(status_code=404, detail="Order details not found")
+    if not details:
+        raise HTTPException(status_code=404, detail="Детали заказов не найдены")
 
     return [
         OrderDetailOut(
-            **detail.__dict__,
-            order_date=order_date
+            id=detail.OrderDetail.id,
+            order_id=detail.OrderDetail.order_id,
+            product_id=detail.OrderDetail.product_id,
+            product_name=detail.product_name,
+            quantity=detail.OrderDetail.quantity,
+            price_per_unit=detail.OrderDetail.price_per_unit,
+            order_date=detail.order_date
         )
-        for detail, order_date in results
+        for detail in details
     ]
 
-
+# Пример для get_order_details_by_order_id
 @order_detail_router.get("/order/{order_id}", response_model=list[OrderDetailOut])
 async def get_order_details_by_order_id(
         order_id: int,
         db: AsyncSession = Depends(get_db),
         _: TokenData = Depends(require_role(["admin", "customer"]))
 ):
-    """
-    Получить все детали заказа по ID заказа
-    Возвращает список товаров в заказе с их названиями и другими данными
-    """
-    try:
-        # Проверяем существует ли заказ
-        order_exists = await db.execute(select(Order).where(Order.id == order_id))
-        if not order_exists.scalar_one_or_none():
-            raise HTTPException(status_code=404, detail="Заказ не найден")
-
-        # Получаем детали заказа с информацией о товарах
-        result = await db.execute(
-            select(
-                OrderDetail,
-                Product.name.label("product_name"),
-                Product.description.label("product_description"),
-                Order.order_date
-            )
-            .join(Product, OrderDetail.product_id == Product.id)
-            .join(Order, OrderDetail.order_id == Order.id)
-            .where(OrderDetail.order_id == order_id)
-            .order_by(OrderDetail.id)
+    # Получаем данные с join
+    result = await db.execute(
+        select(
+            OrderDetail,
+            Product.name.label("product_name"),
+            Order.order_date
         )
+        .join(Product, OrderDetail.product_id == Product.id)
+        .join(Order, OrderDetail.order_id == Order.id)
+        .where(OrderDetail.order_id == order_id)
+    )
 
-        order_details = result.all()
+    items = result.all()
 
-        if not order_details:
-            return []  # Возвращаем пустой список, если деталей нет
-
-        return [
-            {
-                "id": detail.OrderDetail.id,
-                "order_id": detail.OrderDetail.order_id,
-                "product_id": detail.OrderDetail.product_id,
-                "product_name": detail.product_name,
-                "product_description": detail.product_description,
-                "quantity": detail.OrderDetail.quantity,
-                "price_per_unit": detail.OrderDetail.price_per_unit,
-                "total_price": detail.OrderDetail.quantity * detail.OrderDetail.price_per_unit,
-                "order_date": detail.order_date
-            }
-            for detail in order_details
-        ]
-
-    except Exception as e:
-        print(f"Error fetching order details: {str(e)}")
-        raise HTTPException(status_code=500, detail="Ошибка при получении деталей заказа")
+    # Преобразуем в Pydantic модель
+    return [
+        OrderDetailOut(
+            id=item.OrderDetail.id,
+            order_id=item.OrderDetail.order_id,
+            product_id=item.OrderDetail.product_id,
+            product_name=item.product_name,  # берём из join
+            quantity=item.OrderDetail.quantity,
+            price_per_unit=item.OrderDetail.price_per_unit,
+            order_date=item.order_date
+        )
+        for item in items
+    ]
